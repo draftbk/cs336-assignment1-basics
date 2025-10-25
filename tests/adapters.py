@@ -562,6 +562,43 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+# Helper functions for BPE training (module-level for multiprocessing)
+import re
+import regex
+from collections import Counter
+
+# Regex pattern for pre-tokenization
+_BPE_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+def _pre_tokenize(text):
+    """Pre-tokenize text using GPT-2 style regex pattern."""
+    return [m.group(0) for m in regex.finditer(_BPE_PAT, text)]
+
+def _process_chunk_for_bpe(args):
+    """Process a single chunk and return word frequencies (for multiprocessing)."""
+    input_path, start, end, special_tokens_pattern = args
+    chunk_word_freqs = Counter()
+
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+        # Split on special tokens to prevent merging across boundaries
+        if special_tokens_pattern:
+            text_segments = re.split(special_tokens_pattern, chunk)
+        else:
+            text_segments = [chunk]
+
+        # Pre-tokenize each segment separately
+        for segment in text_segments:
+            if segment:  # Skip empty segments
+                pre_tokens = _pre_tokenize(segment)
+                for token in pre_tokens:
+                    chunk_word_freqs[token] += 1
+
+    return chunk_word_freqs
+
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -589,4 +626,171 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    # read file
+    from cs336_basics.pretokenization_example import find_chunk_boundaries
+    from collections import Counter, defaultdict
+    from multiprocessing import Pool
+    import time
+
+    # Create a regex pattern to split on special tokens
+    # Use re.escape to handle special characters in tokens
+    special_tokens_pattern = "|".join(re.escape(token) for token in special_tokens)
+
+    # Step 1: Pre-tokenize and count frequencies (in parallel)
+    step_start = time.time()
+    print("\n[1/5] Finding chunk boundaries...")
+
+    with open(input_path, "rb") as f:
+        # Use more processes for faster pre-tokenization
+        # Use min of 32 or cpu_count() to avoid overwhelming the system
+        import os
+        num_processes = min(32, os.cpu_count() or 4)
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+    print(f"      Found {len(boundaries)-1} chunks in {time.time()-step_start:.2f}s")
+
+    # Prepare arguments for parallel processing
+    chunk_args = [
+        (input_path, start, end, special_tokens_pattern)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+    # Process chunks in parallel
+    step_start = time.time()
+    print(f"[2/5] Pre-tokenizing corpus in parallel (using {num_processes} processes)...")
+    with Pool(processes=num_processes) as pool:
+        chunk_results = pool.map(_process_chunk_for_bpe, chunk_args)
+    print(f"      Pre-tokenization complete in {time.time()-step_start:.2f}s")
+
+    # Merge results from all chunks
+    step_start = time.time()
+    print(f"[3/5] Merging results from all chunks...")
+    word_freqs = Counter()
+    for chunk_freqs in chunk_results:
+        word_freqs.update(chunk_freqs)
+    print(f"      Found {len(word_freqs)} unique tokens in {time.time()-step_start:.2f}s")
+    # Step 2: Initialize vocabulary with individual bytes
+    step_start = time.time()
+    print(f"[4/5] Initializing vocabulary and computing initial pair frequencies...")
+
+    vocab = {}
+    next_id = 0
+    # Add special tokens first
+    for special_token in special_tokens:
+        vocab[next_id] = special_token.encode("utf-8")
+        next_id += 1
+
+    # Add all individual bytes (0-255)
+    for i in range(256):
+        vocab[next_id] = bytes([i])
+        next_id += 1
+
+    # Step 3: Convert word frequencies to splits (list of individual bytes for each word)
+    splits = {}
+    for word, frequency in word_freqs.items():
+        splits[word] = [bytes([b]) for b in word.encode("utf-8")]
+
+    # Step 4: Initialize pair frequencies (optimization: compute once)
+    # Also build reverse index: pair -> set of words containing that pair
+    pair_freqs = defaultdict(int)
+    pair_to_words = defaultdict(set)
+
+    for word, freq in word_freqs.items():
+        split = splits[word]
+        for i in range(len(split) - 1):
+            pair = (split[i], split[i + 1])
+            pair_freqs[pair] += freq
+            pair_to_words[pair].add(word)
+
+    print(f"      Initial vocab size: {len(vocab)}, Unique pairs: {len(pair_freqs)}")
+    print(f"      Initialization complete in {time.time()-step_start:.2f}s\n")
+
+    # Step 5: Merge the most frequent pairs
+    print(f"[5/5] Performing {vocab_size - len(vocab)} BPE merges...")
+    merges = []
+    total_merges = vocab_size - len(vocab)
+
+    # Try to import tqdm for a nice progress bar
+    try:
+        from tqdm import tqdm
+        use_tqdm = True
+    except ImportError:
+        use_tqdm = False
+
+    # Create progress bar
+    if use_tqdm:
+        pbar = tqdm(range(total_merges), desc="Training BPE", unit="merge")
+    else:
+        pbar = range(total_merges)
+
+    for merge_idx in pbar:
+        if not pair_freqs:
+            break
+
+        # Find the most frequent pair with deterministic tie-breaking
+        # Sort by frequency (descending), then by lexicographically greater pair
+        best_pair = max(pair_freqs.items(), key=lambda x: (x[1], x[0]))[0]
+        merges.append(best_pair)
+
+        # Update progress bar with merge info (only if using tqdm)
+        if use_tqdm and (merge_idx + 1) % 5 == 0:
+            try:
+                token1_str = best_pair[0].decode('utf-8', errors='replace')
+                token2_str = best_pair[1].decode('utf-8', errors='replace')
+                merged_str = (best_pair[0] + best_pair[1]).decode('utf-8', errors='replace')
+                pbar.set_postfix_str(f"Last: '{token1_str}'+'{token2_str}'->'{merged_str}'"[:50])
+            except:
+                pass
+
+        # Add the merged token to vocab
+        merged_token = best_pair[0] + best_pair[1]
+        vocab[next_id] = merged_token
+        next_id += 1
+
+        # Update splits and incrementally update pair frequencies
+        # OPTIMIZATION: Only iterate through words that contain the merged pair!
+        affected_words = list(pair_to_words.get(best_pair, []))  # Make a copy since we'll modify dict
+
+        for word in affected_words:
+            split = splits[word]
+            freq = word_freqs[word]
+
+            # First pass: Remove ALL old pairs from pair_freqs before any modification
+            for i in range(len(split) - 1):
+                old_pair = (split[i], split[i + 1])
+                pair_freqs[old_pair] -= freq
+                if pair_freqs[old_pair] == 0:
+                    del pair_freqs[old_pair]
+
+            # Second pass: Perform the merge
+            new_split = []
+            i = 0
+            while i < len(split):
+                if i < len(split) - 1 and split[i] == best_pair[0] and split[i + 1] == best_pair[1]:
+                    # Merge at position i
+                    new_split.append(merged_token)
+                    i += 2
+                else:
+                    new_split.append(split[i])
+                    i += 1
+
+            splits[word] = new_split
+
+            # Third pass: Add ALL new pairs to pair_freqs
+            for i in range(len(new_split) - 1):
+                new_pair = (new_split[i], new_split[i + 1])
+                pair_freqs[new_pair] += freq
+
+        # Rebuild pair_to_words for the next iteration
+        # Only need to rebuild for pairs that were affected
+        if best_pair in pair_to_words:
+            del pair_to_words[best_pair]
+
+        # For words that were affected, rebuild their pair mappings
+        for word in affected_words:
+            split = splits[word]
+            for i in range(len(split) - 1):
+                pair = (split[i], split[i + 1])
+                pair_to_words[pair].add(word)
+
+    return vocab, merges
